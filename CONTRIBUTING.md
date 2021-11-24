@@ -63,3 +63,11 @@ PATCH version when you make backwards compatible bug fixes.
 For every sprint we increase the PATCH version.
 
 This is based on [Semantic Versioning](https://semver.org/).
+
+### Git hooks
+Please make sure, that you use our git hooks.
+You can use
+```shell
+git config --local core.hooksPath .githooks/
+```
+to enable them
