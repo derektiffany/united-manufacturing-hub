@@ -3,6 +3,7 @@ package main
 import (
 	"encoding/json"
 	"github.com/beeker1121/goque"
+	"github.com/united-manufacturing-hub/united-manufacturing-hub/internal"
 	"go.uber.org/zap"
 	"time"
 )
@@ -21,33 +22,33 @@ type processValueQueueF64 struct {
 }
 
 type ValueDataHandler struct {
-	pgI32    *goque.PriorityQueue
-	pgF64    *goque.PriorityQueue
-	shutdown bool
+	priorityQueueI32 *goque.PriorityQueue
+	priorityQueueF64 *goque.PriorityQueue
+	shutdown         bool
 }
 
 func NewValueDataHandler() (handler *ValueDataHandler) {
 	const queuePathDBI32 = "/data/ValueDataI32"
 	var err error
-	var pgI32 *goque.PriorityQueue
-	pgI32, err = SetupQueue(queuePathDBI32)
+	var priorityQueueI32 *goque.PriorityQueue
+	priorityQueueI32, err = SetupQueue(queuePathDBI32)
 	if err != nil {
 		zap.S().Errorf("Error setting up remote queue (%s)", queuePathDBI32, err)
 		return
 	}
 
 	const queuePathDBF64 = "/data/ValueDataF64"
-	var pgF64 *goque.PriorityQueue
-	pgF64, err = SetupQueue(queuePathDBF64)
+	var priorityQueueF64 *goque.PriorityQueue
+	priorityQueueF64, err = SetupQueue(queuePathDBF64)
 	if err != nil {
 		zap.S().Errorf("Error setting up remote queue (%s)", queuePathDBF64, err)
 		return
 	}
 
 	handler = &ValueDataHandler{
-		pgF64:    pgF64,
-		pgI32:    pgI32,
-		shutdown: false,
+		priorityQueueF64: priorityQueueF64,
+		priorityQueueI32: priorityQueueI32,
+		shutdown:         false,
 	}
 	return
 }
@@ -55,11 +56,11 @@ func NewValueDataHandler() (handler *ValueDataHandler) {
 func (r ValueDataHandler) reportLength() {
 	for !r.shutdown {
 		time.Sleep(10 * time.Second)
-		if r.pgI32.Length() > 0 {
-			zap.S().Debugf("ValueDataHandler queue length (I32): %d", r.pgI32.Length())
+		if r.priorityQueueI32.Length() > 0 {
+			zap.S().Debugf("ValueDataHandler queue length (I32): %d", r.priorityQueueI32.Length())
 		}
-		if r.pgF64.Length() > 0 {
-			zap.S().Debugf("ValueDataHandler queue length (F64): %d", r.pgF64.Length())
+		if r.priorityQueueF64.Length() > 0 {
+			zap.S().Debugf("ValueDataHandler queue length (F64): %d", r.priorityQueueF64.Length())
 		}
 	}
 }
@@ -71,13 +72,21 @@ func (r ValueDataHandler) Setup() {
 
 func (r ValueDataHandler) processI32() {
 	var items []*goque.PriorityItem
+	loopsWithError := int64(0)
 	for !r.shutdown {
 		items = r.dequeueI32()
+		if len(items) == 0 {
+			time.Sleep(10 * time.Millisecond)
+			continue
+		}
 		faultyItems, err := storeItemsIntoDatabaseProcessValue(items)
+
 		if err != nil {
 			zap.S().Errorf("err: %s", err)
-			ShutdownApplicationGraceful()
-			return
+			switch GetPostgresErrorRecoveryOptions(err) {
+			case Unrecoverable:
+				ShutdownApplicationGraceful()
+			}
 		}
 		// Empty the array, without de-allocating memory
 		items = items[:0]
@@ -89,17 +98,34 @@ func (r ValueDataHandler) processI32() {
 			}
 			r.enqueueI32(faultyItem.Value, prio)
 		}
+
+		if err != nil || len(faultyItems) > 0 {
+			loopsWithError += 1
+		} else {
+			loopsWithError = 0
+		}
+
+		internal.SleepBackedOff(loopsWithError, 10000*time.Nanosecond, 1000*time.Millisecond)
 	}
 }
+
 func (r ValueDataHandler) processF64() {
 	var items []*goque.PriorityItem
+	loopsWithError := int64(0)
 	for !r.shutdown {
 		items = r.dequeueF64()
+		if len(items) == 0 {
+			time.Sleep(10 * time.Millisecond)
+			continue
+		}
 		faultyItems, err := storeItemsIntoDatabaseProcessValueFloat64(items)
+
 		if err != nil {
 			zap.S().Errorf("err: %s", err)
-			ShutdownApplicationGraceful()
-			return
+			switch GetPostgresErrorRecoveryOptions(err) {
+			case Unrecoverable:
+				ShutdownApplicationGraceful()
+			}
 		}
 		// Empty the array, without de-allocating memory
 		items = items[:0]
@@ -111,19 +137,27 @@ func (r ValueDataHandler) processF64() {
 			}
 			r.enqueueF64(faultyItem.Value, prio)
 		}
+
+		if err != nil || len(faultyItems) > 0 {
+			loopsWithError += 1
+		} else {
+			loopsWithError = 0
+		}
+
+		internal.SleepBackedOff(loopsWithError, 10000*time.Nanosecond, 1000*time.Millisecond)
 	}
 }
 
 func (r ValueDataHandler) dequeueF64() (items []*goque.PriorityItem) {
-	if r.pgF64.Length() > 0 {
-		item, err := r.pgF64.Dequeue()
+	if r.priorityQueueF64.Length() > 0 {
+		item, err := r.priorityQueueF64.Dequeue()
 		if err != nil {
 			return
 		}
 		items = append(items, item)
 
 		for true {
-			nextItem, err := r.pgF64.DequeueByPriority(item.Priority)
+			nextItem, err := r.priorityQueueF64.DequeueByPriority(item.Priority)
 			if err != nil {
 				break
 			}
@@ -134,15 +168,15 @@ func (r ValueDataHandler) dequeueF64() (items []*goque.PriorityItem) {
 }
 
 func (r ValueDataHandler) dequeueI32() (items []*goque.PriorityItem) {
-	if r.pgI32.Length() > 0 {
-		item, err := r.pgI32.Dequeue()
+	if r.priorityQueueI32.Length() > 0 {
+		item, err := r.priorityQueueI32.Dequeue()
 		if err != nil {
 			return
 		}
 		items = append(items, item)
 
 		for true {
-			nextItem, err := r.pgI32.DequeueByPriority(item.Priority)
+			nextItem, err := r.priorityQueueI32.DequeueByPriority(item.Priority)
 			if err != nil {
 				break
 			}
@@ -153,14 +187,14 @@ func (r ValueDataHandler) dequeueI32() (items []*goque.PriorityItem) {
 }
 
 func (r ValueDataHandler) enqueueI32(bytes []byte, priority uint8) {
-	_, err := r.pgI32.Enqueue(priority, bytes)
+	_, err := r.priorityQueueI32.Enqueue(priority, bytes)
 	if err != nil {
 		zap.S().Warnf("Failed to enqueue item", bytes, err)
 		return
 	}
 }
 func (r ValueDataHandler) enqueueF64(bytes []byte, priority uint8) {
-	_, err := r.pgF64.Enqueue(priority, bytes)
+	_, err := r.priorityQueueF64.Enqueue(priority, bytes)
 	if err != nil {
 		zap.S().Warnf("Failed to enqueue item", bytes, err)
 		return
@@ -168,14 +202,14 @@ func (r ValueDataHandler) enqueueF64(bytes []byte, priority uint8) {
 }
 
 func (r ValueDataHandler) Shutdown() (err error) {
-	zap.S().Warnf("[ValueDataHandler] shutting down, Queue length: F64: %d,I32: %d", r.pgF64.Length(), r.pgI32.Length())
+	zap.S().Warnf("[ValueDataHandler] shutting down, Queue length: F64: %d,I32: %d", r.priorityQueueF64.Length(), r.priorityQueueI32.Length())
 	r.shutdown = true
-	time.Sleep(5 * time.Second)
-	err = CloseQueue(r.pgI32)
+
+	err = CloseQueue(r.priorityQueueI32)
 	return
 }
 
-func (r ValueDataHandler) EnqueueMQTT(customerID string, location string, assetID string, payload []byte) {
+func (r ValueDataHandler) EnqueueMQTT(customerID string, location string, assetID string, payload []byte, recursionDepth int64) {
 	zap.S().Debugf("[ValueDataHandler]")
 	var parsedPayload interface{}
 
@@ -185,7 +219,18 @@ func (r ValueDataHandler) EnqueueMQTT(customerID string, location string, assetI
 		return
 	}
 
-	DBassetID := GetAssetID(customerID, location, assetID)
+	DBassetID, success := GetAssetID(customerID, location, assetID, 0)
+	if !success {
+		go func() {
+			if r.shutdown {
+				storedRawMQTTHandler.EnqueueMQTT(customerID, location, assetID, payload, Prefix.AddOrder, recursionDepth+1)
+			} else {
+				internal.SleepBackedOff(recursionDepth, 10000*time.Nanosecond, 1000*time.Millisecond)
+				r.EnqueueMQTT(customerID, location, assetID, payload, recursionDepth+1)
+			}
+		}()
+		return
+	}
 
 	// process unknown data structure according to https://blog.golang.org/json
 	m := parsedPayload.(map[string]interface{})

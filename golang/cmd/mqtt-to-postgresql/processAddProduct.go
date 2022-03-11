@@ -3,6 +3,7 @@ package main
 import (
 	"encoding/json"
 	"github.com/beeker1121/goque"
+	"github.com/united-manufacturing-hub/united-manufacturing-hub/internal"
 	"go.uber.org/zap"
 	"time"
 )
@@ -18,15 +19,15 @@ type addProduct struct {
 }
 
 type AddProductHandler struct {
-	pg       *goque.PriorityQueue
-	shutdown bool
+	priorityQueue *goque.PriorityQueue
+	shutdown      bool
 }
 
 func NewAddProductHandler() (handler *AddProductHandler) {
 	const queuePathDB = "/data/AddProduct"
-	var pg *goque.PriorityQueue
+	var priorityQueue *goque.PriorityQueue
 	var err error
-	pg, err = SetupQueue(queuePathDB)
+	priorityQueue, err = SetupQueue(queuePathDB)
 	if err != nil {
 		zap.S().Errorf("Error setting up remote queue (%s)", queuePathDB, err)
 		zap.S().Errorf("err: %s", err)
@@ -35,8 +36,8 @@ func NewAddProductHandler() (handler *AddProductHandler) {
 	}
 
 	handler = &AddProductHandler{
-		pg:       pg,
-		shutdown: false,
+		priorityQueue: priorityQueue,
+		shutdown:      false,
 	}
 	return
 }
@@ -44,8 +45,8 @@ func NewAddProductHandler() (handler *AddProductHandler) {
 func (r AddProductHandler) reportLength() {
 	for !r.shutdown {
 		time.Sleep(10 * time.Second)
-		if r.pg.Length() > 0 {
-			zap.S().Debugf("AddProductHandler queue length: %d", r.pg.Length())
+		if r.priorityQueue.Length() > 0 {
+			zap.S().Debugf("AddProductHandler queue length: %d", r.priorityQueue.Length())
 		}
 	}
 }
@@ -55,23 +56,26 @@ func (r AddProductHandler) Setup() {
 }
 func (r AddProductHandler) process() {
 	var items []*goque.PriorityItem
+	loopsWithError := int64(0)
 	for !r.shutdown {
 		items = r.dequeue()
 		if len(items) == 0 {
-			time.Sleep(100 * time.Millisecond)
+			time.Sleep(10 * time.Millisecond)
 			continue
 		}
-		zap.S().Debugf("Item len: %d", len(items))
-		faultyItems, err := storeItemsIntoDatabaseAddProduct(items)
-		zap.S().Debugf("Faulty item len: %d", len(items))
+
+		faultyItems, err := storeItemsIntoDatabaseAddProduct(items, 0)
+
 		if err != nil {
 			zap.S().Errorf("err: %s", err)
-			ShutdownApplicationGraceful()
-			return
+			switch GetPostgresErrorRecoveryOptions(err) {
+			case Unrecoverable:
+				ShutdownApplicationGraceful()
+			}
 		}
 		// Empty the array, without de-allocating memory
 		items = items[:0]
-		zap.S().Debugf("Item [empty] len: %d", len(items))
+
 		for _, faultyItem := range faultyItems {
 			var prio uint8
 			prio = faultyItem.Priority + 1
@@ -81,19 +85,27 @@ func (r AddProductHandler) process() {
 			zap.S().Debugf("Inserting faultyItem: %d", prio, faultyItems)
 			r.enqueue(faultyItem.Value, prio)
 		}
+
+		if err != nil || len(faultyItems) > 0 {
+			loopsWithError += 1
+		} else {
+			loopsWithError = 0
+		}
+
+		internal.SleepBackedOff(loopsWithError, 10000*time.Nanosecond, 1000*time.Millisecond)
 	}
 }
 
 func (r AddProductHandler) dequeue() (items []*goque.PriorityItem) {
-	if r.pg.Length() > 0 {
-		item, err := r.pg.Dequeue()
+	if r.priorityQueue.Length() > 0 {
+		item, err := r.priorityQueue.Dequeue()
 		if err != nil {
 			return
 		}
 		items = append(items, item)
 
 		for true {
-			nextItem, err := r.pg.DequeueByPriority(item.Priority)
+			nextItem, err := r.priorityQueue.DequeueByPriority(item.Priority)
 			if err != nil {
 				break
 			}
@@ -104,7 +116,7 @@ func (r AddProductHandler) dequeue() (items []*goque.PriorityItem) {
 }
 
 func (r AddProductHandler) enqueue(bytes []byte, priority uint8) {
-	_, err := r.pg.Enqueue(priority, bytes)
+	_, err := r.priorityQueue.Enqueue(priority, bytes)
 	if err != nil {
 		zap.S().Warnf("Failed to enqueue item", bytes, err)
 		return
@@ -112,14 +124,14 @@ func (r AddProductHandler) enqueue(bytes []byte, priority uint8) {
 }
 
 func (r AddProductHandler) Shutdown() (err error) {
-	zap.S().Warnf("[AddProductHandler] shutting down, Queue length: %d", r.pg.Length())
+	zap.S().Warnf("[AddProductHandler] shutting down, Queue length: %d", r.priorityQueue.Length())
 	r.shutdown = true
-	time.Sleep(5 * time.Second)
-	err = CloseQueue(r.pg)
+
+	err = CloseQueue(r.priorityQueue)
 	return
 }
 
-func (r AddProductHandler) EnqueueMQTT(customerID string, location string, assetID string, payload []byte) {
+func (r AddProductHandler) EnqueueMQTT(customerID string, location string, assetID string, payload []byte, recursionDepth int64) {
 	zap.S().Debugf("[AddProductHandler]")
 	var parsedPayload addProduct
 
@@ -129,11 +141,26 @@ func (r AddProductHandler) EnqueueMQTT(customerID string, location string, asset
 		return
 	}
 
-	DBassetID := GetAssetID(customerID, location, assetID)
+	DBassetID, success := GetAssetID(customerID, location, assetID, 0)
+	if !success {
+		go func() {
+			if r.shutdown {
+				storedRawMQTTHandler.EnqueueMQTT(customerID, location, assetID, payload, Prefix.AddOrder, recursionDepth+1)
+			} else {
+				internal.SleepBackedOff(recursionDepth, 10000*time.Nanosecond, 1000*time.Millisecond)
+				r.EnqueueMQTT(customerID, location, assetID, payload, recursionDepth+1)
+			}
+		}()
+		return
+	}
 	newObject := addProductQueue{
 		DBAssetID:            DBassetID,
 		ProductName:          parsedPayload.ProductName,
 		TimePerUnitInSeconds: parsedPayload.TimePerUnitInSeconds,
+	}
+	if !ValidateStruct(newObject) {
+		zap.S().Errorf("Failed to validate struct of type addProductQueue", newObject)
+		return
 	}
 
 	marshal, err := json.Marshal(newObject)

@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"runtime/debug"
 	"syscall"
 	"time"
 
@@ -40,10 +41,15 @@ var valueDataHandler ValueDataHandler
 var valueStringHandler ValueStringHandler
 var storedRawMQTTHandler StoredRawMQTTHandler
 
+var DebugMode = false
+
+var buildtime string
+
 func main() {
 	// Setup logger and set as global
 	var logger *zap.Logger
 	if os.Getenv("LOGGING_LEVEL") == "DEVELOPMENT" {
+		DebugMode = true
 		logger, _ = zap.NewDevelopment()
 	} else {
 
@@ -61,9 +67,10 @@ func main() {
 	PQUser := os.Getenv("POSTGRES_USER")
 	PQPassword := os.Getenv("POSTGRES_PASSWORD")
 	PWDBName := os.Getenv("POSTGRES_DATABASE")
-	SSLMODE := os.Getenv("POSTGRES_SSLMODE")
 
 	zap.S().Debugf("######################################################################################## Starting program..", PQHost, PQUser, PWDBName)
+
+	zap.S().Infof("This is mqtt-to-postgresql build date: %s", buildtime)
 
 	// Prometheus
 	metricsPath := "/metrics"
@@ -89,11 +96,27 @@ func main() {
 	redisPassword := os.Getenv("REDIS_PASSWORD")
 	redisDB := 0 // default database
 
+	// Important: This has to be above REDIS, Postgresql and MQTT
+	zap.S().Debugf("Setting up raw queue")
+	storedRawMQTTHandler = *NewStoredRawMQTTHandler()
+
+	zap.S().Debugf("Setting up MQTT")
+	podName := os.Getenv("MY_POD_NAME")
+	mqttTopic := os.Getenv("MQTT_TOPIC")
+
+	zap.S().Debugf("Setting up redis")
 	internal.InitCache(redisURI, redisURI2, redisURI3, redisPassword, redisDB, dryRun)
 
-	zap.S().Debugf("Setting up database")
+	for {
+		if internal.IsRedisAvailable() {
+			break
+		}
+		zap.S().Debugf("Redis not yet available")
+		time.Sleep(1 * time.Second)
+	}
 
-	SetupDB(PQUser, PQPassword, PWDBName, PQHost, PQPort, health, SSLMODE, dryRun)
+	zap.S().Debugf("Setting up database")
+	SetupDB(PQUser, PQPassword, PWDBName, PQHost, PQPort, health, dryRun)
 	// Setting up queues
 	zap.S().Debugf("Setting up queues")
 
@@ -118,7 +141,6 @@ func main() {
 	uniqueProductHandler = *NewUniqueProductHandler()
 	valueDataHandler = *NewValueDataHandler()
 	valueStringHandler = *NewValueStringHandler()
-	storedRawMQTTHandler = *NewStoredRawMQTTHandler()
 
 	addOrderHandler.Setup()
 	addParentToChildHandler.Setup()
@@ -141,11 +163,11 @@ func main() {
 	uniqueProductHandler.Setup()
 	valueDataHandler.Setup()
 	valueStringHandler.Setup()
+
+	//Only try to process old messages, once redis and pg are available !
 	storedRawMQTTHandler.Setup()
 
-	zap.S().Debugf("Setting up MQTT")
-	podName := os.Getenv("MY_POD_NAME")
-	mqttTopic := os.Getenv("MQTT_TOPIC")
+	time.Sleep(1 * time.Second)
 	SetupMQTT(certificateName, mqttBrokerURL, mqttTopic, health, podName)
 
 	// Allow graceful shutdown
@@ -168,6 +190,15 @@ func main() {
 		ShutdownApplicationGraceful()
 
 	}()
+
+	if DebugMode {
+		go func() {
+			for !shuttingDown {
+				zap.S().Debugf("Heartbeat")
+				time.Sleep(60 * time.Second)
+			}
+		}()
+	}
 
 	select {} // block forever
 }
@@ -284,7 +315,6 @@ func ShutdownApplicationGraceful() {
 		zap.S().Errorf("Failed to shutdown queue")
 	}
 
-	time.Sleep(5 * time.Second)
 	err = storedRawMQTTHandler.Shutdown()
 	if err != nil {
 		zap.S().Errorf("Failed to shutdown queue")
@@ -293,6 +323,13 @@ func ShutdownApplicationGraceful() {
 	time.Sleep(15 * time.Second) // Wait that all data is processed
 
 	ShutdownDB()
+
+	zap.S().Debugf("===================================")
+	zap.S().Debugf("=========== STACK TRACE ===========")
+	zap.S().Debugf("===================================")
+	debug.PrintStack()
+	zap.S().Debugf("===================================")
+	time.Sleep(15 * time.Second)
 
 	zap.S().Infof("Successfull shutdown. Exiting.")
 

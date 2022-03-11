@@ -9,6 +9,7 @@ import (
 
 	"context"
 	"github.com/go-redis/redis/v8"
+	"github.com/patrickmn/go-cache"
 	"github.com/rung/go-safecast"
 	"github.com/united-manufacturing-hub/united-manufacturing-hub/pkg/datamodel"
 	"go.uber.org/zap"
@@ -16,8 +17,12 @@ import (
 
 var rdb *redis.Client
 var ctx = context.Background()
+var memCache *cache.Cache
 
-var dataExpiration time.Duration
+var redisDataExpiration time.Duration
+var memoryDataExpiration time.Duration
+
+var redisInitialized bool
 
 // InitCache initializes a redis cache
 func InitCache(redisURI string, redisURI2 string, redisURI3 string, redisPassword string, redisDB int, dryRun string) {
@@ -34,13 +39,39 @@ func InitCache(redisURI string, redisURI2 string, redisURI3 string, redisPasswor
 		DB:               redisDB,
 	})
 
-	dataExpiration = 12 * time.Hour
+	redisDataExpiration = 12 * time.Hour
+	memoryDataExpiration = 10 * time.Second
+
+	memCache = cache.New(memoryDataExpiration, 20*time.Second)
+	redisInitialized = true
+}
+
+func InitMemcache() {
+	memoryDataExpiration = 10 * time.Second
+	memCache = cache.New(memoryDataExpiration, 20*time.Second)
+	redisInitialized = false
+}
+
+func IsRedisAvailable() bool {
+	if !redisInitialized {
+		return false
+	}
+	if rdb != nil {
+		statusCmd := rdb.Ping(ctx)
+
+		if statusCmd != nil && statusCmd.Val() == "PONG" {
+			return true
+		}
+		zap.S().Debugf("Redis Error: ", statusCmd)
+	}
+	return false
 }
 
 // AsHash returns a hash for a given interface
 func AsHash(o interface{}) string {
 	h := crc32.NewIEEE() // modified for quicker hashing
-	h.Write([]byte(fmt.Sprintf("%v", o)))
+	// This cannot fail
+	_, _ = h.Write([]byte(fmt.Sprintf("%v", o)))
 
 	return fmt.Sprintf("%x", h.Sum(nil))
 }
@@ -93,7 +124,7 @@ func StoreProcessStatesToCache(key string, processedStateArray []datamodel.State
 		return
 	}
 
-	err = rdb.Set(ctx, key, b, dataExpiration).Err()
+	err = rdb.Set(ctx, key, b, redisDataExpiration).Err()
 	if err != nil {
 		zap.S().Errorf("redis failed")
 		return
@@ -153,7 +184,7 @@ func StoreCalculatateLowSpeedStatesToCache(from time.Time, to time.Time, assetID
 		return
 	}
 
-	err = rdb.Set(ctx, key, b, dataExpiration).Err()
+	err = rdb.Set(ctx, key, b, redisDataExpiration).Err()
 	if err != nil {
 		zap.S().Errorf("redis failed: %+v", err)
 		return
@@ -213,7 +244,7 @@ func StoreRawStatesToCache(assetID uint32, from time.Time, to time.Time, configu
 		return
 	}
 
-	err = rdb.Set(ctx, key, b, dataExpiration).Err()
+	err = rdb.Set(ctx, key, b, redisDataExpiration).Err()
 	if err != nil {
 		zap.S().Errorf("redis failed")
 		return
@@ -273,7 +304,7 @@ func StoreRawShiftsToCache(assetID uint32, from time.Time, to time.Time, configu
 		return
 	}
 
-	err = rdb.Set(ctx, key, b, dataExpiration).Err()
+	err = rdb.Set(ctx, key, b, redisDataExpiration).Err()
 	if err != nil {
 		zap.S().Errorf("redis failed")
 		return
@@ -333,7 +364,7 @@ func StoreRawCountsToCache(assetID uint32, from time.Time, to time.Time, data []
 		return
 	}
 
-	err = rdb.Set(ctx, key, b, dataExpiration).Err()
+	err = rdb.Set(ctx, key, b, redisDataExpiration).Err()
 	if err != nil {
 		zap.S().Errorf("redis failed")
 		return
@@ -390,7 +421,7 @@ func StoreAverageStateTimeToCache(key string, data []interface{}) {
 		return
 	}
 
-	err = rdb.Set(ctx, key, b, dataExpiration).Err()
+	err = rdb.Set(ctx, key, b, redisDataExpiration).Err()
 	if err != nil {
 		zap.S().Errorf("redis failed")
 		return
@@ -451,7 +482,7 @@ func StoreDistinctProcessValuesToCache(customerID string, location string, asset
 		return
 	}
 
-	err = rdb.Set(ctx, key, b, dataExpiration).Err()
+	err = rdb.Set(ctx, key, b, redisDataExpiration).Err()
 	if err != nil {
 		zap.S().Errorf("redis failed")
 		return
@@ -507,7 +538,7 @@ func StoreCustomerConfigurationToCache(customerID string, data datamodel.Custome
 		return
 	}
 
-	err = rdb.Set(ctx, key, b, dataExpiration).Err()
+	err = rdb.Set(ctx, key, b, redisDataExpiration).Err()
 	if err != nil {
 		zap.S().Errorf("redis failed")
 		return
@@ -570,7 +601,7 @@ func StoreAssetIDToCache(customerID string, location string, assetID string, DBa
 
 	b := strconv.Itoa(int(DBassetID))
 
-	err := rdb.Set(ctx, key, b, dataExpiration).Err()
+	err := rdb.Set(ctx, key, b, redisDataExpiration).Err()
 	if err != nil {
 		zap.S().Errorf("redis failed")
 		return
@@ -633,7 +664,7 @@ func StoreUniqueProductIDToCache(aid string, DBassetID uint32, uid uint32) {
 
 	b := strconv.Itoa(int(uid))
 
-	err := rdb.Set(ctx, key, b, dataExpiration).Err()
+	err := rdb.Set(ctx, key, b, redisDataExpiration).Err()
 	if err != nil {
 		zap.S().Errorf("redis failed")
 		return
@@ -696,9 +727,66 @@ func StoreProductIDToCache(productName int32, DBassetID uint32, DBProductId uint
 
 	b := strconv.Itoa(int(DBProductId))
 
-	err := rdb.Set(ctx, key, b, dataExpiration).Err()
+	err := rdb.Set(ctx, key, b, redisDataExpiration).Err()
 	if err != nil {
 		zap.S().Errorf("redis failed")
 		return
 	}
+}
+
+// GetTiered Attempts to get key from memory cache, if fails it falls back to redis
+func GetTiered(key string) (cached bool, value interface{}) {
+	//Check if in memCache
+	value, cached = memCache.Get(key)
+	if cached {
+		zap.S().Infof("Found in memcache")
+		return
+	}
+
+	var err error
+	//Check if in redis
+	d := time.Now().Add(memoryDataExpiration)
+	ctx, cancel := context.WithDeadline(context.Background(), d)
+	defer cancel()
+
+	value, err = rdb.Get(ctx, key).Bytes()
+	if err != nil {
+		zap.S().Infof("Not found in redis")
+		return false, nil
+	}
+	cached = true
+	zap.S().Infof("Found in redis")
+
+	//Write back to memCache
+	memCache.SetDefault(key, value)
+	return
+}
+
+// SetTiered sets memcache and redis with expiration
+func SetTiered(key string, value interface{}, redisExpiration time.Duration) {
+	memCache.SetDefault(key, value)
+	rdb.Set(ctx, key, value, redisExpiration)
+}
+
+//SetTieredLongTerm is an helper, that calls SetTiered with default redis expiration
+func SetTieredLongTerm(key string, value interface{}) {
+	SetTiered(key, value, redisDataExpiration)
+}
+
+//SetTieredShortTerm is an helper, that calls SetTiered with default memory expiration
+func SetTieredShortTerm(key string, value interface{}) {
+	SetTiered(key, value, memoryDataExpiration)
+}
+
+func SetMemcached(key string, value interface{}) {
+	memCache.SetDefault(key, value)
+}
+
+func GetMemcached(key string) (value interface{}, found bool) {
+	value, found = memCache.Get(key)
+	return
+}
+
+func SetMemcachedLong(key string, value interface{}, d time.Duration) {
+	memCache.Set(key, value, d)
 }

@@ -3,6 +3,7 @@ package main
 import (
 	"encoding/json"
 	"github.com/beeker1121/goque"
+	"github.com/united-manufacturing-hub/united-manufacturing-hub/internal"
 	"go.uber.org/zap"
 	"time"
 )
@@ -18,15 +19,15 @@ type addShift struct {
 }
 
 type AddShiftHandler struct {
-	pg       *goque.PriorityQueue
-	shutdown bool
+	priorityQueue *goque.PriorityQueue
+	shutdown      bool
 }
 
 func NewAddShiftHandler() (handler *AddShiftHandler) {
 	const queuePathDB = "/data/AddShift"
-	var pg *goque.PriorityQueue
+	var priorityQueue *goque.PriorityQueue
 	var err error
-	pg, err = SetupQueue(queuePathDB)
+	priorityQueue, err = SetupQueue(queuePathDB)
 	if err != nil {
 		zap.S().Errorf("Error setting up remote queue (%s)", queuePathDB, err)
 		zap.S().Errorf("err: %s", err)
@@ -35,8 +36,8 @@ func NewAddShiftHandler() (handler *AddShiftHandler) {
 	}
 
 	handler = &AddShiftHandler{
-		pg:       pg,
-		shutdown: false,
+		priorityQueue: priorityQueue,
+		shutdown:      false,
 	}
 	return
 }
@@ -44,8 +45,8 @@ func NewAddShiftHandler() (handler *AddShiftHandler) {
 func (r AddShiftHandler) reportLength() {
 	for !r.shutdown {
 		time.Sleep(10 * time.Second)
-		if r.pg.Length() > 0 {
-			zap.S().Debugf("AddShiftHandler queue length: %d", r.pg.Length())
+		if r.priorityQueue.Length() > 0 {
+			zap.S().Debugf("AddShiftHandler queue length: %d", r.priorityQueue.Length())
 		}
 	}
 }
@@ -55,18 +56,15 @@ func (r AddShiftHandler) Setup() {
 }
 func (r AddShiftHandler) process() {
 	var items []*goque.PriorityItem
+	loopsWithError := int64(0)
 	for !r.shutdown {
 		items = r.dequeue()
 		if len(items) == 0 {
-			time.Sleep(100 * time.Millisecond)
+			time.Sleep(10 * time.Millisecond)
 			continue
 		}
-		faultyItems, err := storeItemsIntoDatabaseShift(items)
-		if err != nil {
-			zap.S().Errorf("err: %s", err)
-			ShutdownApplicationGraceful()
-			return
-		}
+		faultyItems, err := storeItemsIntoDatabaseShift(items, 0)
+
 		// Empty the array, without de-allocating memory
 		items = items[:0]
 		for _, faultyItem := range faultyItems {
@@ -77,19 +75,35 @@ func (r AddShiftHandler) process() {
 			}
 			r.enqueue(faultyItem.Value, prio)
 		}
+
+		if err != nil {
+			zap.S().Errorf("err: %s", err)
+			switch GetPostgresErrorRecoveryOptions(err) {
+			case Unrecoverable:
+				ShutdownApplicationGraceful()
+			}
+		}
+
+		if err != nil || len(faultyItems) > 0 {
+			loopsWithError += 1
+		} else {
+			loopsWithError = 0
+		}
+
+		internal.SleepBackedOff(loopsWithError, 10000*time.Nanosecond, 1000*time.Millisecond)
 	}
 }
 
 func (r AddShiftHandler) dequeue() (items []*goque.PriorityItem) {
-	if r.pg.Length() > 0 {
-		item, err := r.pg.Dequeue()
+	if r.priorityQueue.Length() > 0 {
+		item, err := r.priorityQueue.Dequeue()
 		if err != nil {
 			return
 		}
 		items = append(items, item)
 
 		for true {
-			nextItem, err := r.pg.DequeueByPriority(item.Priority)
+			nextItem, err := r.priorityQueue.DequeueByPriority(item.Priority)
 			if err != nil {
 				break
 			}
@@ -100,7 +114,7 @@ func (r AddShiftHandler) dequeue() (items []*goque.PriorityItem) {
 }
 
 func (r AddShiftHandler) enqueue(bytes []byte, priority uint8) {
-	_, err := r.pg.Enqueue(priority, bytes)
+	_, err := r.priorityQueue.Enqueue(priority, bytes)
 	if err != nil {
 		zap.S().Warnf("Failed to enqueue item", bytes, err)
 		return
@@ -108,14 +122,14 @@ func (r AddShiftHandler) enqueue(bytes []byte, priority uint8) {
 }
 
 func (r AddShiftHandler) Shutdown() (err error) {
-	zap.S().Warnf("[AddShiftHandler] shutting down, Queue length: %d", r.pg.Length())
+	zap.S().Warnf("[AddShiftHandler] shutting down, Queue length: %d", r.priorityQueue.Length())
 	r.shutdown = true
-	time.Sleep(5 * time.Second)
-	err = CloseQueue(r.pg)
+
+	err = CloseQueue(r.priorityQueue)
 	return
 }
 
-func (r AddShiftHandler) EnqueueMQTT(customerID string, location string, assetID string, payload []byte) {
+func (r AddShiftHandler) EnqueueMQTT(customerID string, location string, assetID string, payload []byte, recursionDepth int64) {
 	zap.S().Debugf("[AddShiftHandler]")
 	var parsedPayload addShift
 
@@ -125,11 +139,26 @@ func (r AddShiftHandler) EnqueueMQTT(customerID string, location string, assetID
 		return
 	}
 
-	DBassetID := GetAssetID(customerID, location, assetID)
+	DBassetID, success := GetAssetID(customerID, location, assetID, 0)
+	if !success {
+		go func() {
+			if r.shutdown {
+				storedRawMQTTHandler.EnqueueMQTT(customerID, location, assetID, payload, Prefix.AddOrder, recursionDepth+1)
+			} else {
+				internal.SleepBackedOff(recursionDepth, 10000*time.Nanosecond, 1000*time.Millisecond)
+				r.EnqueueMQTT(customerID, location, assetID, payload, recursionDepth+1)
+			}
+		}()
+		return
+	}
 	newObject := addShiftQueue{
 		TimestampMs:    parsedPayload.TimestampMs,
 		TimestampMsEnd: parsedPayload.TimestampMsEnd,
 		DBAssetID:      DBassetID,
+	}
+	if !ValidateStruct(newObject) {
+		zap.S().Errorf("Failed to validate struct of type addShiftQueue", newObject)
+		return
 	}
 
 	marshal, err := json.Marshal(newObject)
